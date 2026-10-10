@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Collect SSTP servers
         run: python3 sstp_collect.py
@@ -26,7 +26,7 @@ jobs:
         run: |
           git config user.name "sstp-bot"
           git config user.email "sstp-bot@users.noreply.github.com"
-          git add sstp_with_country_ip.txt
+          git add sstp.txt
           if git diff --cached --quiet; then
             echo "No change."
             exit 0
