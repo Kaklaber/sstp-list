@@ -1,0 +1,39 @@
+name: sstp-collect
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sstp-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect SSTP servers
+        run: python3 sstp_collect.py
+
+      - name: Commit if changed
+        run: |
+          git config user.name "sstp-bot"
+          git config user.email "sstp-bot@users.noreply.github.com"
+          git add sstp_with_country_ip.txt
+          if git diff --cached --quiet; then
+            echo "No change."
+            exit 0
+          fi
+          git commit -m "SSTP update $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do
+            git pull --rebase && git push && exit 0
+            sleep 5
+          done
+          exit 1
