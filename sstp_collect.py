@@ -8,8 +8,16 @@ Each run:
   3. Tests all of them: API servers on port 443 and on their own TCP port
      (taken from the OpenVPN settings in the API list), saved servers on
      their saved port. A server passes when it answers a real SSTP request.
+     A network error (timeout, reset) is tried twice before the server counts
+     as failed. The test accepts old servers (TLS 1.0 / 1.1, weak ciphers) and
+     never checks the certificate, the same as an SSTP client with the
+     certificate check turned off.
   4. Writes only the servers that passed to sstp.txt. Servers that no longer
      work are removed. No line appears twice.
+  5. Safety check: if fewer than half of the saved servers work (a sign of a
+     network problem on the runner, not of 50% of the servers dying within
+     one hour), sstp.txt is NOT changed and the run ends with an error.
+     Use --force to write the file anyway.
 
 Output (the only file it writes):
   sstp.txt   "Country | ip:port", sorted by country, then IP
@@ -36,6 +44,7 @@ import sys
 import time
 import urllib.request
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 API_URLS = ["http://www.vpngate.net/api/iphone/", "https://www.vpngate.net/api/iphone/"]
@@ -44,6 +53,10 @@ SSTP_URI = "/sra_{BA195980-CD49-458b-9E23-C84EE0ADCD75}/"
 OUT_FILE = "sstp.txt"
 OLD_OUT_FILE = "sstp_with_country_ip.txt"   # earlier name, read once if sstp.txt does not exist yet
 TIMEOUT = 8
+ATTEMPTS = 2          # tries per address when the connection fails with a network error
+RETRY_DELAY = 3       # seconds between those tries
+MIN_SAVED_FOR_CHECK = 20   # the safety check only applies when the saved file has at least this many entries
+MIN_KEEP_RATIO = 0.5       # ...and refuses to write if fewer than this share of them work now
 WORKERS = 32
 # API country names that differ from the names in the F0rc3Run list.
 COUNTRY_NAMES = {
@@ -53,10 +66,24 @@ COUNTRY_NAMES = {
 }
 LINE_RE = re.compile(r"^\s*(.+?)\s*\|\s*(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\s*$")
 
-# VPN Gate servers use self-signed certificates, so the test checks the SSTP answer, not the certificate.
+# VPN Gate servers use self-signed certificates, so the test checks the SSTP answer, not the certificate
+# (no certificate check, the same as an SSTP client with the check turned off).
+# Python on a current Linux refuses TLS 1.0 / 1.1 by default, so a working server that only speaks an old
+# TLS version would be dropped. The test only asks "does it answer SSTP?" and sends no secrets, so the
+# minimum version and the OpenSSL security level are lowered.
 TLS = ssl.create_default_context()
 TLS.check_hostname = False
 TLS.verify_mode = ssl.CERT_NONE
+try:
+    TLS.set_ciphers("DEFAULT:@SECLEVEL=0")
+except ssl.SSLError:
+    pass    # this Python/OpenSSL build does not know SECLEVEL: keep the default ciphers
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)     # Python 3.12 warns that TLSv1 is deprecated
+    try:
+        TLS.minimum_version = ssl.TLSVersion.TLSv1
+    except (AttributeError, ValueError, ssl.SSLError):
+        pass    # this build cannot go below its default: keep it
 
 
 def fetch_api():
@@ -69,7 +96,7 @@ def fetch_api():
     for attempt in range(3):
         for url in API_URLS:
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "sstp-collector/3.0"})
+                req = urllib.request.Request(url, headers={"User-Agent": "sstp-collector/3.1"})
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     return resp.read().decode("utf-8", errors="replace")
             except OSError as e:
@@ -152,21 +179,35 @@ def add_saved(servers, saved):
 
 
 def sstp_ok(host, ip, port):
-    """True if the server answers an SSTP_DUPLEX_POST with HTTP 200. Always a direct connection."""
+    """True if the server answers an SSTP_DUPLEX_POST with HTTP 200. Always a direct connection.
+
+    A network error (timeout, reset, failed handshake) is tried ATTEMPTS times in total, so one lost
+    packet does not remove a good server. A refused connection, or an answer that is not HTTP 200, is final.
+    """
     request = (
         f"SSTP_DUPLEX_POST {SSTP_URI} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"SSTPCORRELATIONID: {{{uuid.uuid4()}}}\r\n"
         "Content-Length: 18446744073709551615\r\n\r\n"
     ).encode("ascii")
-    try:
-        with socket.create_connection((ip, port), timeout=TIMEOUT) as raw:
-            with TLS.wrap_socket(raw) as tls:
-                tls.sendall(request)
-                reply = tls.recv(256)
-        return reply.startswith(b"HTTP/1.1 200")
-    except (OSError, ValueError):
-        return False
+    for attempt in range(ATTEMPTS):
+        try:
+            with socket.create_connection((ip, port), timeout=TIMEOUT) as raw:
+                with TLS.wrap_socket(raw) as tls:
+                    tls.sendall(request)
+                    reply = b""
+                    while len(reply) < 12:      # "HTTP/1.1 200" is 12 bytes; a first recv() can be shorter
+                        chunk = tls.recv(256)
+                        if not chunk:
+                            break
+                        reply += chunk
+            return reply.startswith(b"HTTP/1.1 200")
+        except ConnectionRefusedError:
+            return False
+        except (OSError, ValueError):
+            if attempt + 1 < ATTEMPTS:
+                time.sleep(RETRY_DELAY)
+    return False
 
 
 def test_server(c):
@@ -205,6 +246,8 @@ def main():
     ap = argparse.ArgumentParser(description="Collect working SSTP servers from the VPN Gate API.")
     ap.add_argument("--csv", help="read this file instead of downloading the API list")
     ap.add_argument("--out", default=OUT_FILE, help=f"output file (default {OUT_FILE})")
+    ap.add_argument("--force", action="store_true",
+                    help="write the file even if fewer than half of the saved servers work")
     args = ap.parse_args()
 
     if args.csv:
@@ -239,6 +282,12 @@ def main():
 
     if not working:
         sys.exit(f"No server passed the SSTP test (is the internet working?). {args.out} was left unchanged.")
+
+    if (not args.force and len(saved) >= MIN_SAVED_FOR_CHECK
+            and len(working) < len(saved) * MIN_KEEP_RATIO):
+        sys.exit(f"Only {len(working)} working now, but {len(saved)} were saved. That is a drop of more than "
+                 f"{round((1 - MIN_KEEP_RATIO) * 100)}%, which looks like a network problem and not real change. "
+                 f"{args.out} was left unchanged. Use --force to write it anyway.")
 
     entries = sorted(working.items(), key=lambda kv: (kv[1].lower(), ipaddress.IPv4Address(kv[0][0]), kv[0][1]))
     write_file(args.out, "".join(f"{country} | {ip}:{port}\n" for (ip, port), country in entries))
