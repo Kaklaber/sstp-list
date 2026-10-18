@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Write sstp.txt even if most saved servers stopped working"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -20,7 +25,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Collect SSTP servers
-        run: python3 sstp_collect.py
+        run: python3 sstp_collect.py ${{ inputs.force && '--force' || '' }}
 
       - name: Commit if changed
         run: |
