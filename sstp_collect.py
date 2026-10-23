@@ -11,16 +11,21 @@ Each run:
      A network error (timeout, reset) is tried twice before the server counts
      as failed. The test accepts old servers (TLS 1.0 / 1.1, weak ciphers) and
      never checks the certificate, the same as an SSTP client with the
-     certificate check turned off.
-  4. Writes only the servers that passed to sstp.txt. Servers that no longer
-     work are removed. No line appears twice.
+     certificate check turned off. The ping of a server is the time its TCP
+     connection took to open (measured on the attempt that passed, from the
+     machine that runs this script).
+  4. Writes the servers that passed to sstp.txt, lowest ping first. Servers
+     that no longer work are removed, except Iran servers: they are always
+     listed, answering or not, and the ones that do not answer come last.
+     Russia servers are never tested or listed. No line appears twice.
   5. Safety check: if fewer than half of the saved servers work (a sign of a
      network problem on the runner, not of 50% of the servers dying within
      one hour), sstp.txt is NOT changed and the run ends with an error.
+     Iran servers are not counted in this check.
      Use --force to write the file anyway.
 
 Output (the only file it writes):
-  sstp.txt   "Country | ip:port", sorted by country, then IP
+  sstp.txt   "Country | ip:port", sorted by ping, lowest first
 
 Proxy: http_proxy / https_proxy is used only to download the VPN Gate list.
 The SSTP test always connects directly.
@@ -58,6 +63,8 @@ RETRY_DELAY = 3       # seconds between those tries
 MIN_SAVED_FOR_CHECK = 20   # the safety check only applies when the saved file has at least this many entries
 MIN_KEEP_RATIO = 0.5       # ...and refuses to write if fewer than this share of them work now
 WORKERS = 32
+DROP_COUNTRY = "russia"    # never tested, never listed
+KEEP_COUNTRY = "iran"      # always listed, even when it does not answer
 # API country names that differ from the names in the F0rc3Run list.
 COUNTRY_NAMES = {
     "Korea Republic of": "South Korea",
@@ -129,6 +136,11 @@ def country_name(row):
     return COUNTRY_NAMES.get(name, name)
 
 
+def is_country(name, key):
+    """True if the country name starts with key, so "Russian Federation" and "Russia" both match "russia"."""
+    return name.lower().startswith(key)
+
+
 def own_tcp_port(row):
     """The TCP port from the server's OpenVPN settings, or None if it uses UDP or has none."""
     data = (row.get("OpenVPN_ConfigData_Base64") or "").strip()
@@ -155,9 +167,12 @@ def candidates(rows):
             ipaddress.IPv4Address(ip)
         except ValueError:
             continue
+        country = country_name(r)
+        if is_country(country, DROP_COUNTRY):
+            continue
         name = (r.get("HostName") or "").strip().lower()
         host = name if "." in name else (name + ".opengw.net" if name else ip)
-        c = out.setdefault(ip, {"ip": ip, "host": host, "country": country_name(r), "ports": [DEFAULT_PORT]})
+        c = out.setdefault(ip, {"ip": ip, "host": host, "country": country, "ports": [DEFAULT_PORT]})
         port = own_tcp_port(r)
         if port and port not in c["ports"]:
             c["ports"].append(port)
@@ -179,7 +194,8 @@ def add_saved(servers, saved):
 
 
 def sstp_ok(host, ip, port):
-    """True if the server answers an SSTP_DUPLEX_POST with HTTP 200. Always a direct connection.
+    """The ping in ms (time to open the TCP connection) if the server answers an SSTP_DUPLEX_POST with
+    HTTP 200, otherwise None. Always a direct connection.
 
     A network error (timeout, reset, failed handshake) is tried ATTEMPTS times in total, so one lost
     packet does not remove a good server. A refused connection, or an answer that is not HTTP 200, is final.
@@ -192,7 +208,9 @@ def sstp_ok(host, ip, port):
     ).encode("ascii")
     for attempt in range(ATTEMPTS):
         try:
+            start = time.perf_counter()
             with socket.create_connection((ip, port), timeout=TIMEOUT) as raw:
+                ping = (time.perf_counter() - start) * 1000
                 with TLS.wrap_socket(raw) as tls:
                     tls.sendall(request)
                     reply = b""
@@ -201,18 +219,19 @@ def sstp_ok(host, ip, port):
                         if not chunk:
                             break
                         reply += chunk
-            return reply.startswith(b"HTTP/1.1 200")
+            return ping if reply.startswith(b"HTTP/1.1 200") else None
         except ConnectionRefusedError:
-            return False
+            return None
         except (OSError, ValueError):
             if attempt + 1 < ATTEMPTS:
                 time.sleep(RETRY_DELAY)
-    return False
+    return None
 
 
 def test_server(c):
-    """The ports of this server that passed the SSTP test."""
-    return [p for p in c["ports"] if sstp_ok(c["host"], c["ip"], p)]
+    """{port: ping in ms} for the ports of this server that passed the SSTP test."""
+    pings = {p: sstp_ok(c["host"], c["ip"], p) for p in c["ports"]}
+    return {p: ms for p, ms in pings.items() if ms is not None}
 
 
 def load_saved(path):
@@ -230,7 +249,7 @@ def load_saved(path):
             except ValueError:
                 continue
             port = int(m.group(3))
-            if 0 < port < 65536:
+            if 0 < port < 65536 and not is_country(m.group(1), DROP_COUNTRY):
                 saved.setdefault((m.group(2), port), m.group(1))
     return saved
 
@@ -275,26 +294,35 @@ def main():
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         results = list(pool.map(test_server, todo))
 
-    working = {}
+    working, ping = {}, {}      # the addresses that passed: (ip, port) -> country, and (ip, port) -> ping in ms
     for c, ports in zip(todo, results):
-        for p in ports:
+        for p, ms in ports.items():
             working[(c["ip"], p)] = c["country"]
+            ping[(c["ip"], p)] = ms
 
     if not working:
         sys.exit(f"No server passed the SSTP test (is the internet working?). {args.out} was left unchanged.")
 
-    if (not args.force and len(saved) >= MIN_SAVED_FOR_CHECK
-            and len(working) < len(saved) * MIN_KEEP_RATIO):
-        sys.exit(f"Only {len(working)} working now, but {len(saved)} were saved. That is a drop of more than "
+    # Iran is not counted here: its servers are listed whether they answer or not.
+    saved_n = sum(1 for country in saved.values() if not is_country(country, KEEP_COUNTRY))
+    working_n = sum(1 for country in working.values() if not is_country(country, KEEP_COUNTRY))
+    if not args.force and saved_n >= MIN_SAVED_FOR_CHECK and working_n < saved_n * MIN_KEEP_RATIO:
+        sys.exit(f"Only {working_n} working now, but {saved_n} were saved. That is a drop of more than "
                  f"{round((1 - MIN_KEEP_RATIO) * 100)}%, which looks like a network problem and not real change. "
                  f"{args.out} was left unchanged. Use --force to write it anyway.")
 
-    entries = sorted(working.items(), key=lambda kv: (kv[1].lower(), ipaddress.IPv4Address(kv[0][0]), kv[0][1]))
+    # Lowest ping first. Iran servers that did not answer have no ping, so they come last.
+    listed = {(c["ip"], p): c["country"] for c in todo if is_country(c["country"], KEEP_COUNTRY) for p in c["ports"]}
+    listed.update(working)
+    entries = sorted(listed.items(),
+                     key=lambda kv: (ping.get(kv[0], float("inf")), ipaddress.IPv4Address(kv[0][0]), kv[0][1]))
     write_file(args.out, "".join(f"{country} | {ip}:{port}\n" for (ip, port), country in entries))
 
     kept = sum(1 for k in working if k in saved)
-    print(f"Working: {len(entries)} | still working from before: {kept} | new: {len(entries) - kept} | "
-          f"removed (stopped working): {len(saved) - kept} | countries: {len(set(working.values()))} | file: {args.out}")
+    print(f"Working: {len(working)} | Iran kept without an answer: {len(listed) - len(working)} | "
+          f"still working from before: {kept} | new: {len(working) - kept} | "
+          f"removed (stopped working): {sum(1 for k in saved if k not in listed)} | "
+          f"countries: {len(set(listed.values()))} | file: {args.out}")
 
 
 if __name__ == "__main__":
